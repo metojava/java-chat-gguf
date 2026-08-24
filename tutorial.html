@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gguf-chat &mdash; How the Java GGUF Loader Works</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --panel2:#1d212a; --fg:#d7dce3;
+    --muted:#8b94a3; --accent:#4da3ff; --ok:#3fb950; --warn:#d29922;
+    --err:#f85149; --border:#2a2f3a;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:0 0 80px;background:var(--bg);color:var(--fg);
+       font:15px/1.65 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  .wrap{max-width:980px;margin:0 auto;padding:0 24px}
+  header{border-bottom:1px solid var(--border);
+         background:linear-gradient(180deg,#141821 0%,#0f1115 100%);
+         padding:44px 0 34px;margin-bottom:34px}
+  h1{margin:0 0 8px;font-size:29px;letter-spacing:-.4px}
+  h1 code{font-size:27px;color:var(--accent);background:none;padding:0}
+  .sub{color:var(--muted);font-size:15px}
+  h2{margin:46px 0 14px;font-size:21px;letter-spacing:-.2px;
+     padding-bottom:8px;border-bottom:1px solid var(--border)}
+  h3{margin:26px 0 10px;font-size:16.5px;color:#eef2f7}
+  h4{margin:18px 0 8px;font-size:14.5px;color:#cfd6e0}
+  p{margin:12px 0}
+  code{font-family:"Cascadia Code",Consolas,"SF Mono",Menlo,monospace;font-size:13px;
+       background:var(--panel2);padding:2px 6px;border-radius:4px;color:#ffd9a0}
+  pre{background:var(--panel);border:1px solid var(--border);border-radius:8px;
+      padding:14px 16px;overflow-x:auto;margin:14px 0}
+  pre code{background:none;padding:0;color:#cfd6e0;font-size:12.8px;line-height:1.6}
+  .cmt{color:#6b7484}.kw{color:#ff9ec4}.str{color:#a5e08a}.typ{color:#9ad1ff}
+  .del{color:#f85149}.add{color:#3fb950}
+  table{border-collapse:collapse;width:100%;margin:14px 0;font-size:14px}
+  th,td{border:1px solid var(--border);padding:9px 12px;text-align:left;vertical-align:top}
+  th{background:var(--panel2);font-weight:600}
+  td code{font-size:12.5px}
+  .box{border-radius:8px;padding:14px 18px;margin:18px 0;border-left:4px solid;background:var(--panel)}
+  .box p:first-child{margin-top:0}.box p:last-child{margin-bottom:0}
+  .warn{border-color:var(--warn)}.err{border-color:var(--err)}
+  .ok{border-color:var(--ok)}.info{border-color:var(--accent)}
+  .tag{display:inline-block;font-size:11px;font-weight:700;letter-spacing:.6px;
+       text-transform:uppercase;padding:2px 7px;border-radius:4px;margin-right:8px}
+  .tag.warn{background:rgba(210,153,34,.16);color:var(--warn)}
+  .tag.err{background:rgba(248,81,73,.16);color:var(--err)}
+  .tag.ok{background:rgba(63,185,80,.16);color:var(--ok)}
+  .tag.info{background:rgba(77,163,255,.16);color:var(--accent)}
+  ol li,ul li{margin:6px 0}
+  hr{border:0;border-top:1px solid var(--border);margin:34px 0}
+  footer{color:var(--muted);font-size:13px;margin-top:46px;padding-top:18px;
+         border-top:1px solid var(--border)}
+  .flow{font-family:"Cascadia Code",Consolas,monospace;font-size:12.6px;line-height:1.8;color:#cfd6e0}
+  .flow .d{color:#9ad1ff}.flow .n{color:var(--muted)}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <h1><code>gguf-chat</code> &mdash; how the Java GGUF loader works</h1>
+    <div class="sub">de.kherud:llama 4.2.0 &middot; JNI bindings over llama.cpp / GGML &middot; annotated walkthrough, verified on this machine</div>
+  </div>
+</header>
+
+<div class="wrap">
+
+<div class="box err">
+  <p><span class="tag err">Read this first</span>The project in this folder <strong>builds and runs,
+  but produces wrong answers</strong>. Asking it &ldquo;Write a Java method to reverse a string&rdquo;
+  returns <em>&ldquo;It seems like you want me to write something, but I'm not sure what you're
+  asking&hellip;&rdquo;</em> &mdash; the model never sees your question.
+  The cause is a single missing token. See <a href="#bug">section 5</a> for the diagnosis and the
+  one-line fix.</p>
+</div>
+
+<h2>1. What this project is</h2>
+
+<p>A Maven command-line chat application that runs a GGUF model locally in Java. It does
+<em>not</em> reimplement inference &mdash; it calls llama.cpp through JNI.</p>
+
+<table>
+  <tr><th>Layer</th><th>What it is</th></tr>
+  <tr><td><code>GgufChat.java</code></td><td>Your code: CLI parsing, REPL, prompt building, history</td></tr>
+  <tr><td><code>de.kherud:llama</code> 4.2.0</td><td>Java API + JNI glue (<code>LlamaModel</code>, <code>ModelParameters</code>, <code>InferenceParameters</code>)</td></tr>
+  <tr><td><code>jllama.dll</code></td><td>Native bridge, extracted from the JAR to <code>%TEMP%</code> at first use</td></tr>
+  <tr><td>llama.cpp / GGML</td><td>Compiled into the DLL. This JAR bundles <strong>build 4916</strong>, MSVC x64</td></tr>
+  <tr><td><code>.gguf</code> file</td><td>Quantized weights, memory-mapped by GGML</td></tr>
+</table>
+
+<div class="box info">
+  <p><span class="tag info">Two different libraries, easily confused</span>
+  <a href="https://llama4j.com/gguf/">llama4j.com</a> documents
+  <code>com.llama4j:gguf</code>, a pure-Java library for <strong>reading and writing GGUF files</strong>
+  &mdash; metadata, tensor descriptors, offsets. It does <strong>not</strong> run inference.
+  This project uses <code>de.kherud:llama</code>, which <strong>does</strong> run inference via JNI.
+  They solve different problems and can be used together: llama4j to inspect a model's metadata
+  (quant type, context length, chat template) without loading gigabytes, de.kherud to actually
+  generate text.</p>
+</div>
+
+<h3>Verified on this machine</h3>
+<pre><code>mvn -B -DskipTests package        <span class="cmt">&rarr; BUILD SUCCESS</span>
+java -cp target/gguf-chat-0.1.0.jar;target/lib/* com.jm.ggufchat.GgufChat ...
+
+=================================================
+ gguf-chat  (Java + de.kherud:llama / GGML)
+ model : Llama-3.2-1B-Instruct-Q4_K_M.gguf  (0.81 GB)
+ java  : 17.0.12  os=Windows 11
+=================================================
+Extracted 'jllama.dll' to 'C:\Users\dell\AppData\Local\Temp\jllama.dll'
+Model loaded in 1.04 s. ctx=2048, threads=6, gpu-layers=0</code></pre>
+
+<hr>
+
+<h2>2. Execution flow</h2>
+
+<pre class="flow"><code>main()
+ └─ <span class="d">Cli.parse(args)</span>            <span class="n">plain switch over --flags, no dependency</span>
+     └─ <span class="d">resolveModel()</span>          <span class="n">--model, else ./Llama-3.2-3B-Instruct-Q4_K_M.gguf</span>
+         └─ <span class="d">LlamaModel.setLogger()</span>  <span class="n">silence GGML unless --verbose</span>
+             └─ <span class="d">new LlamaModel(mp)</span>   <span class="n">JNI: loads DLL, mmaps weights, builds ctx</span>
+                 ├─ <span class="d">runOneShot()</span>      <span class="n">--prompt: answer once, exit</span>
+                 └─ <span class="d">runRepl()</span>         <span class="n">interactive loop</span>
+                     └─ <span class="d">generate()</span>
+                         ├─ <span class="d">buildLlamaChatPrompt()</span>  <span class="n">history &rarr; Llama-3 markup</span>
+                         ├─ <span class="d">new InferenceParameters()</span>
+                         └─ <span class="d">for (LlamaOutput o : model.generate(ip))</span>
+                                              <span class="n">blocking iterator, one chunk per token</span></code></pre>
+
+<p>The <code>try (LlamaModel model = ...)</code> block matters: <code>LlamaModel</code> is
+<code>AutoCloseable</code> and holds native memory the JVM garbage collector cannot see. Leaving the
+block frees the model. Note also the deliberate <code>System.exit(0)</code> in
+<code>main</code>'s <code>finally</code> &mdash; the native layer starts non-daemon threads that
+otherwise keep the JVM alive after the chat ends.</p>
+
+<hr>
+
+<h2>3. The three API objects</h2>
+
+<h3>ModelParameters &mdash; fixed at load time</h3>
+<pre><code><span class="typ">ModelParameters</span> mp = <span class="kw">new</span> <span class="typ">ModelParameters</span>()
+        .setModel(modelPath.toAbsolutePath().toString())
+        .setCtxSize(cli.ctxSize)      <span class="cmt">// 4096 default</span>
+        .setThreads(cli.threads)      <span class="cmt">// cores/2 default</span>
+        .setGpuLayers(cli.gpuLayers); <span class="cmt">// 0 = pure CPU</span></code></pre>
+<p>These cannot change without reloading the model &mdash; which is why <code>/ctx</code> in the REPL
+only prints a message telling you to restart.</p>
+
+<h3>InferenceParameters &mdash; per request</h3>
+<pre><code><span class="typ">InferenceParameters</span> ip = <span class="kw">new</span> <span class="typ">InferenceParameters</span>(prompt)
+        .setTemperature(cli.temperature)
+        .setTopP(cli.topP)
+        .setTopK(cli.topK)
+        .setRepeatPenalty(cli.repeatPenalty)
+        .setNPredict(cli.maxTokens)
+        .setStopStrings(<span class="str">"&lt;|start_header_id|&gt;"</span>, <span class="str">"&lt;|eot_id|&gt;"</span>)
+        .setSeed(cli.seed);</code></pre>
+
+<h3>LlamaOutput &mdash; streaming</h3>
+<pre><code><span class="kw">for</span> (<span class="typ">LlamaOutput</span> out : model.generate(ip)) {
+    System.out.print(out.text);   <span class="cmt">// arrives incrementally</span>
+    System.out.flush();
+    tokenCount++;
+}</code></pre>
+<p><code>model.generate()</code> returns an <code>Iterable</code>; each step blocks until the native
+side produces the next chunk. That is what makes the typewriter effect work.</p>
+
+<div class="box warn">
+  <p><span class="tag warn">tok/s here is approximate</span><code>tokenCount</code> counts
+  <em>iterations</em>, not tokens. A chunk usually maps to one token but is not guaranteed to, and
+  the timer includes prompt processing. Treat the printed figure as indicative.</p>
+</div>
+
+<hr>
+
+<h2>4. Prompt construction</h2>
+
+<p>Chat models are trained on a strict markup. Llama-3 uses header blocks; the code builds them by
+hand:</p>
+
+<pre><code><span class="kw">private static</span> String buildLlamaChatPrompt(String system, Deque&lt;Message&gt; turns) {
+    StringBuilder sb = <span class="kw">new</span> StringBuilder();
+    <span class="kw">if</span> (system != <span class="kw">null</span> &amp;&amp; !system.isBlank()) {
+        sb.append(<span class="str">"&lt;|start_header_id|&gt;system&lt;|end_header_id|&gt;\n\n"</span>)
+          .append(system.trim()).append(<span class="str">"&lt;|eot_id|&gt;"</span>);
+    }
+    <span class="kw">for</span> (Message m : turns) {
+        sb.append(<span class="str">"&lt;|start_header_id|&gt;"</span>).append(m.role())
+          .append(<span class="str">"&lt;|end_header_id|&gt;\n\n"</span>)
+          .append(m.content()).append(<span class="str">"&lt;|eot_id|&gt;"</span>);
+    }
+    sb.append(<span class="str">"&lt;|start_header_id|&gt;assistant&lt;|end_header_id|&gt;\n\n"</span>);
+    <span class="kw">return</span> sb.toString();
+}</code></pre>
+
+<p>The whole <code>history</code> deque is replayed every turn, which is how the model gets
+conversational memory &mdash; and why long chats get slower and eventually overflow
+<code>--ctx</code>.</p>
+
+<hr>
+
+<h2 id="bug">5. The bug: a missing BOS token</h2>
+
+<div class="box err">
+  <p><span class="tag err">Symptom</span>The model answers as if the question were empty.</p>
+<pre style="margin-top:10px"><code>ai&gt; It seems like you want me to write something, but I'm not sure what you're
+    asking me to write yet! Could you please provide more context...
+   [64 tokens, 3.88 s, 16.51 tok/s]</code></pre>
+</div>
+
+<h3>Diagnosis</h3>
+<p>The Javadoc at line 256 states:</p>
+<pre><code><span class="cmt">* The tokenizer adds the leading BOS (&lt;|begin_of_text|&gt;) automatically,
+ * so we don't prepend it.</span></code></pre>
+
+<p><strong>That assumption is false for this binding.</strong> When a prompt is supplied as a raw
+string via <code>new InferenceParameters(prompt)</code>, it is tokenized <em>without</em>
+<code>add_special</code>, so no <code>&lt;|begin_of_text|&gt;</code> (id 128000) is prepended.
+Llama-3 was trained with BOS always present; without it the header markup is interpreted as
+stray text and the actual question is effectively ignored.</p>
+
+<p>Proved by testing the identical prompt with the token added:</p>
+<table>
+  <tr><th>Prompt</th><th>Result</th></tr>
+  <tr><td>Without <code>&lt;|begin_of_text|&gt;</code></td><td><span style="color:#f85149">&ldquo;I'm not sure what you're asking me to write&hellip;&rdquo;</span></td></tr>
+  <tr><td>With <code>&lt;|begin_of_text|&gt;</code></td><td><span style="color:#3fb950">Correct <code>StringReverser</code> class with a working <code>reverse()</code> method</span></td></tr>
+</table>
+
+<h3>Fix A &mdash; one line (recommended)</h3>
+<pre><code><span class="kw">private static</span> String buildLlamaChatPrompt(String system, Deque&lt;Message&gt; turns) {
+    StringBuilder sb = <span class="kw">new</span> StringBuilder();
+<span class="add">    sb.append("&lt;|begin_of_text|&gt;");          // &lt;-- ADD THIS</span>
+    <span class="kw">if</span> (system != <span class="kw">null</span> &amp;&amp; !system.isBlank()) {
+        ...</code></pre>
+
+<h3>Fix B &mdash; let the binding apply the model's own template</h3>
+<p>More portable: works for Qwen/ChatML and other families without hand-writing markup. Uses the
+<code>chat_template</code> stored in the GGUF metadata.</p>
+<pre><code><span class="typ">List</span>&lt;<span class="typ">Pair</span>&lt;String,String&gt;&gt; msgs = <span class="kw">new</span> ArrayList&lt;&gt;();
+<span class="kw">for</span> (Message m : history) msgs.add(<span class="kw">new</span> <span class="typ">Pair</span>&lt;&gt;(m.role(), m.content()));
+
+<span class="typ">InferenceParameters</span> ip = <span class="kw">new</span> <span class="typ">InferenceParameters</span>(<span class="str">""</span>)
+        .setMessages(systemPrompt, msgs)
+        .setUseChatTemplate(<span class="kw">true</span>)
+        .setTemperature(cli.temperature)
+        .setNPredict(cli.maxTokens);</code></pre>
+
+<div class="box warn">
+  <p><span class="tag warn">Caveat found in testing</span>On this exact version (4.2.0 + bundled
+  build 4916) the <code>setMessages</code> path also misbehaved in a quick test, emitting unrelated
+  text. <strong>Fix A is verified working here; Fix B is the cleaner design but verify it on your
+  setup before relying on it.</strong></p>
+</div>
+
+<h3>Also worth removing</h3>
+<pre><code>.setStopStrings(<span class="str">"&lt;|start_header_id|&gt;"</span>, <span class="str">"&lt;|eot_id|&gt;"</span>)</code></pre>
+<p><code>&lt;|eot_id|&gt;</code> is this model's EOS token (id 128009) and already ends generation
+natively. Matching it as a <em>string</em> is redundant and forces extra per-token substring
+scanning.</p>
+
+<hr>
+
+<h2>6. Performance &mdash; what actually matters</h2>
+
+<div class="box err">
+  <p><span class="tag err">The governing constraint</span>Generating one token requires reading
+  <strong>every weight in the model</strong> from RAM; each is used for a single multiply-add and
+  discarded. Speed is <code>memory bandwidth &divide; model size</code> and almost nothing else.
+  Measured on this machine: a bare 4 GB read loop reaches <strong>24.9 GB/s</strong>, and llama.cpp
+  reaches <strong>24.4 GB/s</strong> while also doing the arithmetic &mdash; 98% of the hardware
+  ceiling. <em>No Java-side tuning can beat physics.</em></p>
+</div>
+
+<h3>Ranked by real impact</h3>
+
+<h4>1. Thread count &mdash; the one setting that matters</h4>
+<p>The default is <code>cores / 2</code> = 4 here, which leaves performance on the table.</p>
+<pre><code>--threads 6    <span class="cmt"># best for a 1B model on this machine</span>
+--threads 8    <span class="cmt"># best for a 7B model</span></code></pre>
+<table>
+  <tr><th>Threads</th><th>Llama-3.2-1B (0.75 GB)</th><th>Qwen2.5-Coder-7B (4.36 GB)</th></tr>
+  <tr><td>4 <span style="color:#8b94a3">(this project's default)</span></td><td>23.7 t/s</td><td>4.67 t/s</td></tr>
+  <tr><td>6</td><td><strong>26.3 t/s</strong></td><td>5.12 t/s</td></tr>
+  <tr><td>8</td><td>26.4 t/s</td><td><strong>5.59 t/s</strong></td></tr>
+</table>
+<p>A small model plateaus early because it partly fits in cache; a large one stays
+bandwidth-starved and uses every thread. Consider changing the default:</p>
+<pre><code><span class="del">int threads = Math.max(1, Runtime.getRuntime().availableProcessors() / 2);</span>
+<span class="add">int threads = Math.max(1, Runtime.getRuntime().availableProcessors() - 2);</span></code></pre>
+
+<h4>2. Context size &mdash; free memory savings</h4>
+<p><code>--ctx 4096</code> is the default; the KV cache grows linearly with it and is allocated up
+front whether used or not. For short Q&amp;A, <code>--ctx 2048</code> halves that with no downside.</p>
+
+<h4>3. Prune the history you resend</h4>
+<p>Every turn re-sends the entire conversation, so prompt-processing cost grows without bound. Cap
+it:</p>
+<pre><code><span class="kw">private static final int</span> MAX_TURNS = <span class="str">8</span>;
+<span class="kw">while</span> (history.size() &gt; MAX_TURNS) history.removeFirst();</code></pre>
+<p>Or use <code>/reset</code> between unrelated questions &mdash; the single most effective habit for
+keeping a long session fast.</p>
+
+<h4>4. Sampling settings &mdash; negligible for speed</h4>
+<p><code>--temp</code>, <code>--top-p</code>, <code>--top-k</code>, <code>--repeat-penalty</code>
+affect <em>output quality</em>, not throughput; sampling is microseconds against a ~180 ms
+per-token memory cost. Use <code>--temp 0</code> for deterministic code generation, not for speed.</p>
+
+<h4>5. JVM flags &mdash; almost irrelevant</h4>
+<p>The weights live in <strong>native</strong> memory, not the Java heap, so <code>-Xmx</code> tuning
+does nothing for inference. The only worthwhile flag avoids a brief startup stall:</p>
+<pre><code>java -XX:+AlwaysPreTouch -cp ... com.jm.ggufchat.GgufChat</code></pre>
+
+<h4>6. GPU offload &mdash; not available here</h4>
+<pre><code>warning: no usable GPU found, --gpu-layers option will be ignored
+warning: one possible reason is that llama.cpp was compiled without GPU support</code></pre>
+<p>The bundled <code>jllama.dll</code> is a CPU-only build, so <code>--gpu-layers</code> is silently
+ignored regardless of hardware.</p>
+
+<h4>7. Things that do <em>not</em> help</h4>
+<table>
+  <tr><th>Idea</th><th>Reality</th></tr>
+  <tr><td>More RAM capacity</td><td>Bandwidth matters, not capacity. The 7B already fits in 13.9 GB.</td></tr>
+  <tr><td>Requantizing Q4_K_M &rarr; Q3_K_M</td><td>Tested: &minus;19% size gave only <strong>+8%</strong> speed (4.61 &rarr; 4.98 t/s). Q3_K blocks cost more CPU to unpack.</td></tr>
+  <tr><td>A different inference engine</td><td>llama.cpp is already at 98% of the memory ceiling.</td></tr>
+  <tr><td>Trees / indexes over weights</td><td>Dense models use every weight in fixed order &mdash; there is nothing to search, and pointer chasing would destroy SIMD and prefetch.</td></tr>
+</table>
+
+<h4>8. The genuinely large wins</h4>
+<ol>
+  <li><strong>Enable XMP/DOCP in the BIOS &mdash; free, up to +33%.</strong> Both DIMMs are rated
+      3200 MT/s but run at <strong>2400</strong>. A bandwidth-bound workload scales almost linearly
+      with memory clock.</li>
+  <li><strong>Use a smaller model.</strong> The 1B is ~4.7&times; faster than the 7B; switch only when needed.</li>
+  <li><strong>Speculative decoding (2&ndash;3&times;).</strong> A small draft model proposes several
+      tokens which the large model verifies in one pass over its weights &mdash; same bytes moved,
+      several tokens produced, identical output. Supported by llama.cpp, though not exposed by this
+      Java binding.</li>
+</ol>
+
+<hr>
+
+<h2>7. Recommended commands</h2>
+
+<pre><code><span class="cmt"># build</span>
+cd C:\Users\dell\Desktop\java-chat-gguf
+mvn -B -DskipTests package
+
+<span class="cmt"># interactive, tuned for this machine</span>
+java -cp <span class="str">"target\gguf-chat-0.1.0.jar;target\lib\*"</span> com.jm.ggufchat.GgufChat <span class="str">`</span>
+     --model <span class="str">"C:\Users\dell\Desktop\Llama-3.2-1B-Instruct-Q4_K_M.gguf"</span> <span class="str">`</span>
+     --threads 6 --ctx 2048
+
+<span class="cmt"># one-shot, deterministic (best for code generation)</span>
+java -cp <span class="str">"target\gguf-chat-0.1.0.jar;target\lib\*"</span> com.jm.ggufchat.GgufChat <span class="str">`</span>
+     --model <span class="str">"...\Llama-3.2-1B-Instruct-Q4_K_M.gguf"</span> <span class="str">`</span>
+     --threads 6 --ctx 2048 --temp 0 <span class="str">`</span>
+     --prompt <span class="str">"Write a Java method to reverse a string."</span>
+
+<span class="cmt"># the 7B model wants every thread</span>
+java -cp <span class="str">"target\gguf-chat-0.1.0.jar;target\lib\*"</span> com.jm.ggufchat.GgufChat <span class="str">`</span>
+     --model <span class="str">"C:\Users\dell\Documents\qwen2.5-coder-7b-instruct-q4_k_m.gguf"</span> <span class="str">`</span>
+     --threads 8 --ctx 2048</code></pre>
+
+<div class="box warn">
+  <p><span class="tag warn">Qwen needs a different template</span><code>buildLlamaChatPrompt()</code>
+  hardcodes Llama-3 markup. Qwen uses ChatML (<code>&lt;|im_start|&gt;</code>), so pointing this
+  program at the Qwen model produces degraded output even after the BOS fix. Use Fix B, or branch on
+  the model family.</p>
+</div>
+
+<h3>REPL commands</h3>
+<table>
+  <tr><th>Command</th><th>Effect</th></tr>
+  <tr><td><code>/help</code></td><td>List commands</td></tr>
+  <tr><td><code>/reset</code></td><td>Clear history &mdash; use often, keeps turns fast</td></tr>
+  <tr><td><code>/system &lt;text&gt;</code></td><td>Replace the system prompt</td></tr>
+  <tr><td><code>/temp &lt;float&gt;</code></td><td>Change temperature live (0 = greedy)</td></tr>
+  <tr><td><code>/info</code></td><td>Print current settings</td></tr>
+  <tr><td><code>/save &lt;file&gt;</code></td><td>Append the last reply to a file</td></tr>
+  <tr><td><code>/ctx &lt;int&gt;</code></td><td>Informational only &mdash; context is fixed at load</td></tr>
+  <tr><td><code>/exit</code></td><td>Quit</td></tr>
+</table>
+
+<hr>
+
+<h2>8. Inspecting a model with llama4j (no loading required)</h2>
+
+<p>The separate <code>com.llama4j:gguf</code> library reads GGUF headers without touching the
+weights &mdash; useful for discovering a model's chat template, context length and quantization
+before deciding how to prompt it.</p>
+
+<pre><code>&lt;dependency&gt;
+    &lt;groupId&gt;com.llama4j&lt;/groupId&gt;
+    &lt;artifactId&gt;gguf&lt;/artifactId&gt;
+    &lt;version&gt;0.1.1&lt;/version&gt;
+&lt;/dependency&gt;</code></pre>
+
+<pre><code><span class="kw">import</span> com.llama4j.gguf.GGUF;
+
+GGUF gguf = GGUF.read(Path.of(<span class="str">"Llama-3.2-1B-Instruct-Q4_K_M.gguf"</span>));
+
+<span class="cmt">// the template this model actually expects</span>
+String tmpl = gguf.getValue(String.class, <span class="str">"tokenizer.chat_template"</span>);
+
+<span class="cmt">// context length it was trained for</span>
+<span class="kw">int</span> ctx = gguf.getValueOrDefault(<span class="kw">int</span>.class, <span class="str">"llama.context_length"</span>, <span class="str">4096</span>);
+
+<span class="cmt">// BOS / EOS ids - exactly the values involved in the bug above</span>
+<span class="kw">int</span> bos = gguf.getValue(<span class="kw">int</span>.class, <span class="str">"tokenizer.ggml.bos_token_id"</span>); <span class="cmt">// 128000</span>
+<span class="kw">int</span> eos = gguf.getValue(<span class="kw">int</span>.class, <span class="str">"tokenizer.ggml.eos_token_id"</span>); <span class="cmt">// 128009</span></code></pre>
+
+<p>It can even read metadata straight from Hugging Face over HTTP, without downloading the file:</p>
+<pre><code><span class="kw">static</span> GGUF readFromHuggingFace(String user, String repo, String file) <span class="kw">throws</span> IOException {
+    URL url = <span class="kw">new</span> URL(<span class="str">"https://hf.co/%s/%s/resolve/main/%s"</span>.formatted(user, repo, file));
+    <span class="kw">try</span> (var ch = Channels.newChannel(
+             <span class="kw">new</span> BufferedInputStream(url.openConnection().getInputStream()))) {
+        <span class="kw">return</span> GGUF.read(ch);
+    }
+}</code></pre>
+
+<p>A practical use: read <code>tokenizer.chat_template</code> at startup and pick the right prompt
+builder automatically, instead of hardcoding Llama-3 markup.</p>
+
+<hr>
+
+<h2>9. Troubleshooting</h2>
+
+<table>
+  <tr><th>Symptom</th><th>Cause &amp; fix</th></tr>
+  <tr>
+    <td>Model replies as if the prompt were empty</td>
+    <td>Missing <code>&lt;|begin_of_text|&gt;</code>. Apply Fix A in section 5.</td>
+  </tr>
+  <tr>
+    <td>Rambling or role-confused output on a non-Llama model</td>
+    <td>Wrong chat template. Qwen needs ChatML. Use Fix B or branch per family.</td>
+  </tr>
+  <tr>
+    <td><code>Model file not found</code></td>
+    <td>Default is <code>./Llama-3.2-3B-Instruct-Q4_K_M.gguf</code> relative to the working directory. Pass <code>--model</code> with an absolute path.</td>
+  </tr>
+  <tr>
+    <td><code>warning: no usable GPU found</code></td>
+    <td>Expected &mdash; the bundled DLL is CPU-only. <code>--gpu-layers</code> is ignored.</td>
+  </tr>
+  <tr>
+    <td>JVM hangs after the chat ends</td>
+    <td>Native non-daemon threads. Already handled by <code>System.exit(0)</code> in <code>main</code>.</td>
+  </tr>
+  <tr>
+    <td>Generation slows down over a long chat</td>
+    <td>The whole history is resent each turn. Use <code>/reset</code> or cap history.</td>
+  </tr>
+  <tr>
+    <td>Reply truncated mid-sentence</td>
+    <td>Hit <code>--max-tokens</code> (default 1024). Raise it.</td>
+  </tr>
+  <tr>
+    <td>Slow first run</td>
+    <td><code>jllama.dll</code> is extracted to <code>%TEMP%</code> once, plus OS page-cache warm-up.</td>
+  </tr>
+  <tr>
+    <td>Maven cannot resolve <code>de.kherud:llama</code></td>
+    <td>First build needs network access; it downloads ~40 MB including the native DLL.</td>
+  </tr>
+</table>
+
+<hr>
+
+<h2>10. Summary of suggested changes</h2>
+
+<ol>
+  <li><strong>Add <code>&lt;|begin_of_text|&gt;</code></strong> to <code>buildLlamaChatPrompt()</code> &mdash; without it the program does not work at all.</li>
+  <li><strong>Change the default thread count</strong> from <code>cores/2</code> to <code>cores-2</code> &mdash; roughly +11% for free.</li>
+  <li><strong>Drop <code>setStopStrings</code></strong> &mdash; <code>&lt;|eot_id|&gt;</code> is already the EOS token.</li>
+  <li><strong>Lower the default <code>--ctx</code></strong> to 2048 for short sessions; it halves KV-cache memory.</li>
+  <li><strong>Cap conversation history</strong> so prompt cost stops growing without bound.</li>
+  <li><strong>Detect the chat template</strong> from GGUF metadata (llama4j, or Fix B) instead of hardcoding Llama-3.</li>
+  <li><strong>Fix the tok/s counter</strong> to measure generation only, excluding prompt processing.</li>
+</ol>
+
+<footer>
+  Tutorial for <code>com.jm.ggufchat.GgufChat</code> &middot; de.kherud:llama 4.2.0
+  (bundled llama.cpp build 4916) &middot; Java 17.0.12 &middot;
+  verified on AMD Ryzen 5 3450U, Windows 11.
+</footer>
+
+</div>
+</body>
+</html>
